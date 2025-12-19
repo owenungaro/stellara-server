@@ -8,6 +8,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import winpty
 
+from minecraft.manager import ServerManager
+
 # -----------------------------
 # App
 # -----------------------------
@@ -20,6 +22,21 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -----------------------------
+# Minecraft Server Manager
+# -----------------------------
+manager = ServerManager()
+
+# Track connected WebSockets per server
+# Maps server_id -> dict of WebSocket -> last_sent_line_index
+_server_websockets: dict[str, dict[WebSocket, int]] = {}
+
+# Track broadcaster tasks per server
+# Maps server_id -> asyncio.Task
+_server_broadcasters: dict[str, asyncio.Task] = {}
+
+_websocket_lock = asyncio.Lock()
 
 # -----------------------------
 # Helpers (Windows "This PC" style)
@@ -210,6 +227,162 @@ def delete_path(path: str):
     except PermissionError:
         log_fs("delete", path, "error", "Permission denied")
         raise HTTPException(status_code=403, detail="Permission denied")
+
+
+# -----------------------------
+# Minecraft Server Console WebSocket
+# -----------------------------
+async def _broadcast_logs(server_id: str, server):
+    """
+    Background task that broadcasts new log lines to all connected WebSocket clients.
+    One task runs per server_id.
+    """
+    last_line_count = 0
+    
+    while True:
+        try:
+            # Check if server is still running
+            if not server.is_running():
+                raise asyncio.CancelledError("Server is not running")
+
+            
+            # Get current log lines (snapshot)
+            log_lines = await asyncio.to_thread(server.get_log_lines)
+            current_line_count = len(log_lines)
+            
+            # If there are new lines, broadcast them
+            if current_line_count > last_line_count:
+                new_lines = log_lines[last_line_count:]
+                new_content = "".join(new_lines)
+                last_line_count = current_line_count
+                
+                # Get list of WebSockets to broadcast to (copy while holding lock)
+                websockets_to_update = []
+                async with _websocket_lock:
+                    if server_id not in _server_websockets:
+                        break
+                    # Copy the dict to avoid holding lock during sends
+                    websockets_to_update = list(_server_websockets[server_id].items())
+                
+                # Broadcast to all clients (outside lock to avoid blocking)
+                disconnected = []
+                for client_ws, last_sent_index in websockets_to_update:
+                    try:
+                        # Only send lines this client hasn't received yet
+                        if current_line_count > last_sent_index:
+                            lines_to_send = log_lines[last_sent_index:]
+                            content_to_send = "".join(lines_to_send)
+                            await client_ws.send_text(content_to_send)
+                            # Update tracked index
+                            async with _websocket_lock:
+                                if server_id in _server_websockets and client_ws in _server_websockets[server_id]:
+                                    _server_websockets[server_id][client_ws] = current_line_count
+                    except Exception:
+                        # Client disconnected
+                        disconnected.append(client_ws)
+                
+                # Remove disconnected clients
+                if disconnected:
+                    async with _websocket_lock:
+                        if server_id in _server_websockets:
+                            for client_ws in disconnected:
+                                _server_websockets[server_id].pop(client_ws, None)
+                            # If no more clients, stop broadcaster
+                            if not _server_websockets[server_id]:
+                                del _server_websockets[server_id]
+                                # Note: Broadcaster will be cancelled by the last client disconnect handler
+                                break
+            
+            # Poll interval (100ms for responsive updates)
+            await asyncio.sleep(0.1)
+            
+        except asyncio.CancelledError:
+            async with _websocket_lock:
+                _server_websockets.pop(server_id, None)
+                _server_broadcasters.pop(server_id, None)
+            break
+        except Exception as e:
+            print(f"[minecraft] Error in broadcaster for '{server_id}': {e}")
+            break
+
+
+@app.websocket("/servers/{server_id}/console")
+async def minecraft_console(ws: WebSocket, server_id: str):
+    await ws.accept()
+    client = ws.client
+    client_addr = f"{client.host}:{client.port}" if client else "unknown"
+    print(f"[minecraft] connect server_id={server_id} client={client_addr}")
+    
+    # Look up the server
+    server = manager.get_server(server_id)
+    if not server or not server.is_running():
+        error_msg = f"[server] Server '{server_id}' is not running\n"
+        try:
+            await ws.send_text(error_msg)
+        except Exception:
+            pass
+        await ws.close()
+        return
+    
+    # Get current log lines to determine starting index
+    log_lines = await asyncio.to_thread(server.get_log_lines)
+    initial_line_count = len(log_lines)
+    
+    # Track this WebSocket connection and start broadcaster if needed
+    async with _websocket_lock:
+        if server_id not in _server_websockets:
+            _server_websockets[server_id] = {}
+        # Initially mark as not having received any lines yet (will update after sending)
+        _server_websockets[server_id][ws] = 0
+        
+        # Start broadcaster if this is the first client
+        if server_id not in _server_broadcasters:
+            broadcaster_task = asyncio.create_task(_broadcast_logs(server_id, server))
+            _server_broadcasters[server_id] = broadcaster_task
+    
+    # Send current log buffer immediately (full history)
+    try:
+        if log_lines:
+            initial_content = "".join(log_lines)
+            await ws.send_text(initial_content)
+            # Update tracked index after successfully sending
+            async with _websocket_lock:
+                if server_id in _server_websockets and ws in _server_websockets[server_id]:
+                    _server_websockets[server_id][ws] = initial_line_count
+    except Exception as e:
+        print(f"[minecraft] Error sending initial logs for '{server_id}': {e}")
+    
+    try:
+        # Forward incoming messages to server
+        while True:
+            try:
+                data = await ws.receive_text()
+                # Write to server stdin (non-blocking)
+                await asyncio.to_thread(server.write, data)
+            except Exception:
+                # WebSocket disconnected or error
+                break
+    except Exception:
+        pass
+    finally:
+        # Remove this WebSocket from tracking
+        async with _websocket_lock:
+            if server_id in _server_websockets:
+                _server_websockets[server_id].pop(ws, None)
+                # If this was the last client, stop the broadcaster
+                if not _server_websockets[server_id]:
+                    del _server_websockets[server_id]
+                    if server_id in _server_broadcasters:
+                        task = _server_broadcasters.pop(server_id)
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                        except Exception:
+                            pass
+        
+        print(f"[minecraft] disconnect server_id={server_id} client={client_addr}")
 
 
 # -----------------------------
